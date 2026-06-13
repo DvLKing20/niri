@@ -243,5 +243,5 @@ assets = [
     ],
 ]
 [patch."https://github.com/Smithay/smithay.git"]
-smithay = { path = "/home/kaif/smithay" }
+smithay = { path = "" }
 
