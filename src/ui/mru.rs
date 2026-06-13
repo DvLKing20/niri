@@ -5,13 +5,11 @@ use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::ensure;
+use cosmic_text::Attrs;
 use niri_config::{
     Action, Bind, Color, Config, CornerRadius, GradientInterpolation, Key, Modifiers, MruDirection,
     MruFilter, MruScope, Trigger,
 };
-use pango::FontDescription;
-use pangocairo::cairo::{self, ImageSurface};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
@@ -37,6 +35,7 @@ use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderCtx;
+use crate::ui::text_renderer::TextRenderer;
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
     with_toplevel_role,
@@ -65,14 +64,8 @@ const STRUT: f64 = 192.;
 /// Padding in the scope indication panel.
 const PANEL_PADDING: i32 = 12;
 
-/// Border size of the scope indication panel.
-const PANEL_BORDER: i32 = 4;
-
 /// Backdrop color behind the previews.
 const BACKDROP_COLOR: Color32F = Color32F::new(0., 0., 0., 0.8);
-
-/// Font used to render the window titles.
-const FONT: &str = "sans 14px";
 
 /// Scopes in the order they are cycled through.
 ///
@@ -227,10 +220,16 @@ struct Thumbnail {
     title_texture: RefCell<TitleTexture>,
     background: RefCell<FocusRing>,
     border: RefCell<FocusRing>,
+    text_renderer: *mut TextRenderer,
 }
 
 impl Thumbnail {
-    fn from_mapped(mapped: &Mapped, clock: Clock, config: niri_config::MruPreviews) -> Self {
+    fn from_mapped(
+        mapped: &Mapped,
+        clock: Clock,
+        config: niri_config::MruPreviews,
+        text_renderer: *mut TextRenderer,
+    ) -> Self {
         let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
 
         let background = FocusRing::new(niri_config::FocusRing {
@@ -259,6 +258,7 @@ impl Thumbnail {
             title_texture: Default::default(),
             background: RefCell::new(background),
             border: RefCell::new(border),
+            text_renderer,
         }
     }
 
@@ -329,9 +329,11 @@ impl Thumbnail {
         scale: f64,
     ) -> Option<MruTexture> {
         with_toplevel_role(mapped.toplevel(), |role| {
-            role.title
-                .as_ref()
-                .and_then(|title| self.title_texture.borrow_mut().get(renderer, title, scale))
+            role.title.as_ref().and_then(|title| {
+                self.title_texture
+                    .borrow_mut()
+                    .get(renderer, title, scale, self.text_renderer)
+            })
         })
     }
 
@@ -587,7 +589,8 @@ impl WindowMru {
             let on_current_workspace = on_current_output && mon.active_workspace_idx() == ws_idx;
 
             for mapped in ws.windows() {
-                let mut thumbnail = Thumbnail::from_mapped(mapped, niri.clock.clone(), config);
+                let mut thumbnail =
+                    Thumbnail::from_mapped(mapped, niri.clock.clone(), config, niri.text_renderer);
                 thumbnail.on_current_output = on_current_output;
                 thumbnail.on_current_workspace = on_current_workspace;
                 thumbnails.push(thumbnail);
@@ -1559,10 +1562,12 @@ impl Inner {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();
 
-        let panel_texture =
-            self.scope_panel
-                .borrow_mut()
-                .get(ctx.as_gles().renderer, scale, self.wmru.scope);
+        let panel_texture = self.scope_panel.borrow_mut().get(
+            ctx.as_gles().renderer,
+            scale,
+            self.wmru.scope,
+            niri.text_renderer,
+        );
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 
@@ -1632,7 +1637,13 @@ impl Inner {
 }
 
 impl TitleTexture {
-    fn get(&mut self, renderer: &mut GlesRenderer, title: &str, scale: f64) -> Option<MruTexture> {
+    fn get(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        title: &str,
+        scale: f64,
+        text_renderer: *mut TextRenderer,
+    ) -> Option<MruTexture> {
         if self.title != title || self.scale != scale {
             self.texture = None;
             self.title = title.to_owned();
@@ -1640,7 +1651,9 @@ impl TitleTexture {
         }
 
         self.texture
-            .get_or_insert_with(|| generate_title_texture(renderer, title, scale).ok())
+            .get_or_insert_with(|| {
+                generate_title_texture(renderer, title, scale, text_renderer).ok()
+            })
             .clone()
     }
 
@@ -1657,36 +1670,32 @@ fn generate_title_texture(
     renderer: &mut GlesRenderer,
     title: &str,
     scale: f64,
+    text_renderer: *mut TextRenderer,
 ) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::generate_title_texture");
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let tr = unsafe { &mut *text_renderer };
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    // On Window CSD, line breaks are either stripped or replaced with the linebreak symbol anyway.
-    // No use rendering it as multiple lines.
-    layout.set_single_paragraph_mode(true);
-    layout.set_font_description(Some(&font));
-    layout.set_text(title);
+    tr.buffer(14.0, scale as f32);
 
-    let (width, height) = layout.pixel_size();
-    ensure!(width > 0 && height > 0);
+    tr.set_text(
+        title,
+        cosmic_text::Align::Center,
+        cosmic_text::Shaping::Advanced,
+        false,
+        (None, None),
+        &Attrs::new(),
+    );
 
-    // Guard against overly long window titles.
-    let width = min(width, 16383);
-    let height = min(height, 16383);
+    let mut pixmap = tr.draw_empy_rect().unwrap();
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
+    tr.draw_text(&mut pixmap, 0.0, 0.0);
 
-    drop(cr);
-    let data = surface.take_data().unwrap();
+    let width = min(pixmap.width() as i32, 16383);
+    let height = min(pixmap.height() as i32, 16383);
+
+    let data = pixmap.take();
+
     let buffer = TextureBuffer::from_memory(
         renderer,
         &data,
@@ -1707,6 +1716,7 @@ impl ScopePanel {
         renderer: &mut GlesRenderer,
         scale: f64,
         scope: MruScope,
+        text_renderer: *mut TextRenderer,
     ) -> Option<MruTexture> {
         if self.scale != scale {
             self.textures = None;
@@ -1714,7 +1724,7 @@ impl ScopePanel {
         }
 
         self.textures
-            .get_or_insert_with(|| generate_scope_panels(renderer, scale).ok())
+            .get_or_insert_with(|| generate_scope_panels(renderer, scale, text_renderer).ok())
             .as_ref()
             .map(|x| x[scope as usize].clone())
     }
@@ -1723,92 +1733,149 @@ impl ScopePanel {
 fn generate_scope_panels(
     renderer: &mut GlesRenderer,
     scale: f64,
+    text_renderer: *mut TextRenderer,
 ) -> anyhow::Result<[MruTexture; 3]> {
-    fn make_panel_text(idx: usize) -> String {
-        let span_unselected = "<span fgcolor='#999999'>";
-        let span_end = "</span>";
-        let span_shortcut = "<span face='mono' bgcolor='#2C2C2C' letter_spacing='5000'><b>";
-        let span_shortcut_end = "</b></span>";
-
-        // Starts with a zero-width space to make letter_spacing work on the left.
-        let mut buf =
-            format!("\u{200B}{span_unselected}{span_shortcut}S{span_shortcut_end}cope:{span_end}");
-
-        for scope in SCOPE_CYCLE {
-            buf.push_str("  ");
-            if scope as usize != idx {
-                buf.push_str(span_unselected);
-            }
-            let text = match scope {
-                MruScope::All => format!("{span_shortcut}A{span_shortcut_end}ll"),
-                MruScope::Output => format!("{span_shortcut}O{span_shortcut_end}utput"),
-                MruScope::Workspace => format!("{span_shortcut}W{span_shortcut_end}orkspace"),
-            };
-            buf.push_str(&text);
-            if scope as usize != idx {
-                buf.push_str(span_end);
-            }
-        }
-
-        buf
-    }
-
-    // Can't wait for array::try_map()
     Ok([
-        render_panel(renderer, scale, &make_panel_text(0))?,
-        render_panel(renderer, scale, &make_panel_text(1))?,
-        render_panel(renderer, scale, &make_panel_text(2))?,
+        render_panel(renderer, scale, 0, text_renderer)?,
+        render_panel(renderer, scale, 1, text_renderer)?,
+        render_panel(renderer, scale, 2, text_renderer)?,
     ])
 }
 
-fn render_panel(renderer: &mut GlesRenderer, scale: f64, text: &str) -> anyhow::Result<MruTexture> {
+fn render_panel(
+    renderer: &mut GlesRenderer,
+    scale: f64,
+    idx: usize,
+    text_renderer: *mut TextRenderer,
+) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::render_panel");
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let padding: f32 = to_physical_precise_round(scale, PANEL_PADDING);
+    let border: f32 = to_physical_precise_round(scale, BORDER);
 
-    let padding: i32 = to_physical_precise_round(scale, PANEL_PADDING);
-    // Keep the border width even to avoid blurry edges.
-    // Render to a dummy surface to determine the size.
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(text);
-    let (mut width, mut height) = layout.pixel_size();
+    let color_selected = cosmic_text::Color::rgb(255, 255, 255);
+    let color_unselected = cosmic_text::Color::rgb(153, 153, 153); // #999999
 
-    width += padding * 2;
-    height += padding * 2;
+    let label_attrs = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::SansSerif)
+        .color(color_unselected);
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    let shortcut_selected = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(cosmic_text::Weight::BOLD)
+        .color(color_selected)
+        .metadata(1); // Highlights the active key badge
 
-    let padding = f64::from(padding);
+    let shortcut_unselected = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(cosmic_text::Weight::BOLD)
+        .color(color_unselected)
+        .metadata(1); // Highlights unselected shortcut badges
 
-    cr.move_to(padding, padding);
+    let text_selected = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::SansSerif)
+        .color(color_selected);
 
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(text);
+    let text_unselected = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::SansSerif)
+        .color(color_unselected);
 
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
+    let mut spans: Vec<(&str, &cosmic_text::Attrs)> = vec![
+        ("S", &shortcut_unselected),
+        ("cope: ", &label_attrs),
+    ];
 
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.5, 0.5, 0.5);
-    cr.set_line_width((f64::from(PANEL_BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
+    for (i, scope) in SCOPE_CYCLE.iter().enumerate() {
+        let is_active = i == idx;
 
-    drop(cr);
-    let data = surface.take_data().unwrap();
+        if i > 0 {
+            spans.push((" ", &text_unselected));
+        }
+
+        match scope {
+            MruScope::All => {
+                spans.push((
+                    "A",
+                    if is_active {
+                        &shortcut_selected
+                    } else {
+                        &shortcut_unselected
+                    },
+                ));
+                spans.push((
+                    "ll",
+                    if is_active {
+                        &text_selected
+                    } else {
+                        &text_unselected
+                    },
+                ));
+            }
+            MruScope::Output => {
+                spans.push((
+                    "O",
+                    if is_active {
+                        &shortcut_selected
+                    } else {
+                        &shortcut_unselected
+                    },
+                ));
+                spans.push((
+                    "utput",
+                    if is_active {
+                        &text_selected
+                    } else {
+                        &text_unselected
+                    },
+                ));
+            }
+            MruScope::Workspace => {
+                spans.push((
+                    "W",
+                    if is_active {
+                        &shortcut_selected
+                    } else {
+                        &shortcut_unselected
+                    },
+                ));
+                spans.push((
+                    "orkspace",
+                    if is_active {
+                        &text_selected
+                    } else {
+                        &text_unselected
+                    },
+                ));
+            }
+        }
+    }
+
+    let tr = unsafe { &mut *text_renderer };
+
+    tr.buffer(14.0, scale as f32);
+
+    tr.set_span(
+        &spans,
+        cosmic_text::Shaping::Advanced,
+        cosmic_text::Align::Center,
+        (None, None),
+        false,
+    );
+
+    let mut pixmap = tr.draw_rect(
+        border,
+        padding,
+        tiny_skia::Color::from_rgba(0.102, 0.102, 0.102, 0.933).unwrap(),
+        tiny_skia::Color::from_rgba(0.2666, 0.2666, 0.2666, 1.0).unwrap(),
+    ).unwrap();
+
+    tr.draw_text(&mut pixmap, border, padding);
+
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+
+    let data = pixmap.take();
+
     let buffer = TextureBuffer::from_memory(
         renderer,
         &data,

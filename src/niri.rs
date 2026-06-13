@@ -172,6 +172,7 @@ use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::text_renderer::TextRenderer;
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -385,7 +386,8 @@ pub struct Niri {
 
     // State that we last sent to the logind LockedHint.
     pub locked_hint: Option<bool>,
-
+    
+    pub text_renderer: *mut TextRenderer,
     pub screenshot_ui: ScreenshotUi,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
@@ -2001,7 +2003,7 @@ impl State {
         self.backend.with_primary_renderer(|renderer| {
             self.niri
                 .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
+                .open(renderer, screenshots, default_output, show_pointer, path, self.niri.text_renderer)
         });
 
         self.niri
@@ -2418,17 +2420,18 @@ impl Niri {
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
         let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(mod_key, &config_.binds);
 
+        let text_renderer = Box::into_raw(Box::new(TextRenderer::default()));
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
-            ConfigErrorNotification::new(animation_clock.clone(), config.clone());
+            ConfigErrorNotification::new(animation_clock.clone(), config.clone(), text_renderer);
 
-        let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
+        let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key, text_renderer);
         if !config_.hotkey_overlay.skip_at_startup {
             hotkey_overlay.show();
         }
 
-        let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
+        let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone(), text_renderer);
 
         #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
@@ -2608,6 +2611,7 @@ impl Niri {
             lock_state: LockState::Unlocked,
             locked_hint: None,
 
+            text_renderer,
             screenshot_ui,
             config_error_notification,
             hotkey_overlay,

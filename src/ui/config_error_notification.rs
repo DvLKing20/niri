@@ -4,24 +4,24 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+use cosmic_text::{Attrs, Weight};
 use niri_config::Config;
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::FontDescription;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::Output;
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Point, Transform};
+use tiny_skia::Color;
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::ui::text_renderer::TextRenderer;
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-const FONT: &str = "sans 14px";
 const BORDER: i32 = 4;
 
 pub struct ConfigErrorNotification {
@@ -34,6 +34,7 @@ pub struct ConfigErrorNotification {
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
+    text_renderer: *mut TextRenderer,
 }
 
 enum State {
@@ -44,13 +45,18 @@ enum State {
 }
 
 impl ConfigErrorNotification {
-    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
+    pub fn new(
+        clock: Clock,
+        config: Rc<RefCell<Config>>,
+        text_renderer: *mut TextRenderer,
+    ) -> Self {
         Self {
             state: State::Hidden,
             buffers: RefCell::new(HashMap::new()),
             created_path: None,
             clock,
             config,
+            text_renderer,
         }
     }
 
@@ -146,7 +152,9 @@ impl ConfigErrorNotification {
         let mut buffers = self.buffers.borrow_mut();
         let buffer = buffers
             .entry(NotNan::new(scale).unwrap())
-            .or_insert_with(move || render(renderer.as_gles_renderer(), scale, path).ok());
+            .or_insert_with(move || {
+                render(renderer.as_gles_renderer(), scale, path, self.text_renderer).ok()
+            });
         let buffer = buffer.clone()?;
 
         let size = buffer.logical_size();
@@ -178,61 +186,80 @@ fn render(
     renderer: &mut GlesRenderer,
     scale: f64,
     created_path: Option<&Path>,
+    text_renderer: *mut TextRenderer,
 ) -> anyhow::Result<TextureBuffer<GlesTexture>> {
     let _span = tracy_client::span!("config_error_notification::render");
 
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
+    let padding: f32 = to_physical_precise_round(scale, PADDING);
+    let border: f32 = to_physical_precise_round(scale, BORDER);
 
-    let mut text = error_text(true);
-    let mut border_color = (1., 0.3, 0.3);
-    if let Some(path) = created_path {
-        text = format!(
-            "Created a default config file at \
-             <span face='monospace' bgcolor='#000000'>{path:?}</span>",
-        );
-        border_color = (0.5, 1., 0.5);
+    let attrs_normal = Attrs::new().family(cosmic_text::Family::SansSerif);
+    let attrs_key = Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(Weight::BOLD)
+        .metadata(1);
+
+    let path: String;
+
+    let (spans, border_color) = if let Some(p) = created_path {
+        path = format!(" {:?} ", p);
+
+        (
+            [
+                ("Created a default ", &attrs_normal),
+                ("config file at ", &attrs_normal),
+                (&path, &attrs_key),
+            ],
+            tiny_skia::Color::from_rgba8(255, 77, 77, 255),
+        )
+    } else {
+        (
+            [
+                (
+                    "Failed to parse the config file. Please run ",
+                    &attrs_normal,
+                ),
+                (" niri validate ", &attrs_key),
+                (" to see the errors.", &attrs_normal),
+            ],
+            tiny_skia::Color::from_rgba8(100, 100, 240, 255),
+        )
     };
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let font: f32 = 14.0;
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(&text);
+    let tr = unsafe { &mut *text_renderer };
+    tr.buffer(font, scale as f32);
 
-    let (mut width, mut height) = layout.pixel_size();
-    width += padding * 2;
-    height += padding * 2;
+    tr.set_span(
+        &spans,
+        cosmic_text::Shaping::Advanced,
+        cosmic_text::Align::Center,
+        (None, None),
+        false,
+    );
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    let mut pixmap = tr
+        .draw_rect(
+            border,
+            padding,
+            Color::from_rgba(0.102, 0.102, 0.102, 0.933).unwrap(),
+            border_color,
+        )
+        .unwrap();
 
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(&text);
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
 
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
+    tr.draw_text_with_highlight(
+        &mut pixmap,
+        border,
+        padding,
+        Color::from_rgba(0.244, 0.233, 0.211, 0.500).unwrap(),
+    );
 
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(border_color.0, border_color.1, border_color.2);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
+    let data = pixmap.take();
 
-    let data = surface.take_data().unwrap();
     let buffer = TextureBuffer::from_memory(
         renderer,
         &data,
@@ -245,14 +272,4 @@ fn render(
     )?;
 
     Ok(buffer)
-}
-
-pub fn error_text(markup: bool) -> String {
-    let command = if markup {
-        "<span face='monospace' bgcolor='#000000'>niri validate</span>"
-    } else {
-        "niri validate"
-    };
-
-    format!("Failed to parse the config file. Please run {command} to see the errors.")
 }

@@ -1,16 +1,14 @@
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashMap;
-use std::f64::consts::TAU;
 use std::iter::zip;
 use std::rc::Rc;
 
 use anyhow::Context;
 use arrayvec::ArrayVec;
+use cosmic_text::Attrs;
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
-use pango::{Alignment, FontDescription};
-use pangocairo::cairo::{self, ImageSurface};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -20,6 +18,7 @@ use smithay::backend::renderer::{ExportMem, Texture as _};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
+use tiny_skia::Color;
 
 use crate::animation::{Animation, Clock};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
@@ -28,21 +27,29 @@ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_texture, RenderTarget};
+use crate::ui::text_renderer::TextRenderer;
 use crate::utils::to_physical_precise_round;
 
 const SELECTION_BORDER: i32 = 2;
 
 const PADDING: i32 = 8;
 const RADIUS: i32 = 16;
-const FONT: &str = "sans 14px";
 const BORDER: i32 = 4;
-const TEXT_HIDE_P: &str =
-    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
-     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to hide the pointer.";
-const TEXT_SHOW_P: &str =
-    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
-     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to show the pointer.";
+const TEXT_HIDE_P: &[&str] = &[
+    ("Press "),
+    (" Space "),
+    (" to save the screenshot.\n\nPress "),
+    (" P "),
+    (" to hide the pointer."),
+];
 
+const TEXT_SHOW_P: &[&str] = &[
+    ("Press "),
+    (" Space "),
+    (" to save the screenshot.\n\nPress "),
+    (" P "),
+    (" to show the pointer."),
+];
 // Ideally the screenshot UI should support cross-output selections. However, that poses some
 // technical challenges when the outputs have different scales and such. So, this implementation
 // allows only single-output selections for now.
@@ -143,6 +150,7 @@ impl ScreenshotUi {
         default_output: Output,
         show_pointer: bool,
         path: Option<String>,
+        text_renderer: *mut TextRenderer,
     ) -> bool {
         if screenshots.is_empty() {
             return false;
@@ -203,7 +211,7 @@ impl ScreenshotUi {
                 let locations = [Default::default(); 8];
 
                 let mut render_panel_ = |text| {
-                    render_panel(renderer, scale, text)
+                    render_panel(renderer, scale, text, text_renderer)
                         .map_err(|err| warn!("error rendering help panel: {err:?}"))
                         .ok()
                 };
@@ -1134,87 +1142,69 @@ fn is_within_capture_button(
 fn render_panel(
     renderer: &mut GlesRenderer,
     scale: f64,
-    text: &str,
+    text: &[&str],
+    text_renderer: *mut TextRenderer,
 ) -> anyhow::Result<TextureBuffer<GlesTexture>> {
     let _span = tracy_client::span!("screenshot_ui::render_panel");
 
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
+    let padding: f32 = to_physical_precise_round(scale, PADDING);
     // Keep the border width even to avoid blurry edges.
-    let border_width = (f64::from(BORDER) / 2. * scale).round() * 2.;
-    let half_border_width = (border_width / 2.) as i32;
-    let radius: i32 = to_physical_precise_round(scale, RADIUS);
-    let circle_stroke: f64 = to_physical_precise_round(scale, 2.);
+    // let border_width = (f64::from(BORDER) / 2. * scale).round() * 2.;
+    // let half_border_width = (border_width / 2.) as i32;
+    let border: f32 = to_physical_precise_round(scale, BORDER);
 
-    // Add 2 px of spacing to separate the backgrounds of the "Space" and "P" keys.
-    let spacing = to_physical_precise_round::<i32>(scale, 2) * 1024;
+    let font_size = 14.0;
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let tr = unsafe { &mut *text_renderer };
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_markup(text);
-    layout.set_spacing(spacing);
+    tr.buffer(font_size, scale as f32);
 
-    let (mut width, mut height) = layout.pixel_size();
+    let default_attrs = Attrs::new()
+        .family(cosmic_text::Family::SansSerif)
+        .color(cosmic_text::Color::rgb(255, 255, 255));
 
-    width += padding + radius * 2 + padding - half_border_width + padding;
-    height = max(height, radius * 2);
-    height += padding * 2;
+    let attrs_key = Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(cosmic_text::Weight::BOLD)
+        .metadata(1);
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    let packed: &[(&str, &Attrs)] = &[
+        (text[0], &default_attrs),
+        (text[1], &attrs_key),
+        (text[2], &default_attrs),
+        (text[3], &attrs_key),
+        (text[4], &default_attrs),
+    ];
 
-    let padding = f64::from(padding);
-    let half_border_width = f64::from(half_border_width);
-    let r = f64::from(radius);
+    tr.set_span(
+        packed,
+        cosmic_text::Shaping::Advanced,
+        cosmic_text::Align::Left,
+        (Some(500.0 * scale as f32), None),
+        false,
+    );
 
-    let yc = f64::from(height / 2);
+    let mut pixmap = tr
+        .draw_rect(
+            border,
+            padding,
+            tiny_skia::Color::from_rgba(0.102, 0.102, 0.102, 0.933).unwrap(),
+            tiny_skia::Color::from_rgba(0.2666, 0.2666, 0.2666, 1.0).unwrap(),
+        )
+        .unwrap();
 
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r, 0., TAU);
-    cr.set_source_rgb(1., 1., 1.);
-    cr.fill()?;
+    let width: i32 = pixmap.width() as i32;
+    let height: i32 = pixmap.height() as i32;
 
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r - circle_stroke, 0., TAU);
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.fill()?;
+    tr.draw_text_with_highlight(
+        &mut pixmap,
+        border,
+        padding,
+        Color::from_rgba(0.244, 0.233, 0.211, 0.500).unwrap(),
+    );
 
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r - circle_stroke * 2., 0., TAU);
-    cr.set_source_rgb(1., 1., 1.);
-    cr.fill()?;
+    let data = pixmap.take();
 
-    cr.move_to(padding + r * 2. + padding - half_border_width, padding);
-
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_markup(text);
-    layout.set_spacing(spacing);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.3, 0.3, 0.3);
-    cr.set_line_width(border_width);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
     let buffer = TextureBuffer::from_memory(
         renderer,
         &data,

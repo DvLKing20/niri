@@ -1,13 +1,9 @@
 use std::cell::RefCell;
-use std::cmp::max;
 use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::iter::zip;
+use std::fmt::{Write as _};
 use std::rc::Rc;
 
 use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::input::keyboard::xkb::keysym_get_name;
@@ -18,13 +14,12 @@ use smithay::utils::{Scale, Transform};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::ui::text_renderer::TextRenderer;
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
 // const MARGIN: i32 = PADDING * 2;
-const FONT: &str = "sans 14px";
 const BORDER: i32 = 4;
-const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
 
 pub struct HotkeyOverlay {
@@ -32,6 +27,7 @@ pub struct HotkeyOverlay {
     config: Rc<RefCell<Config>>,
     mod_key: ModKey,
     buffers: RefCell<HashMap<WeakOutput, RenderedOverlay>>,
+    text_renderer: *mut TextRenderer,
 }
 
 pub struct RenderedOverlay {
@@ -39,12 +35,17 @@ pub struct RenderedOverlay {
 }
 
 impl HotkeyOverlay {
-    pub fn new(config: Rc<RefCell<Config>>, mod_key: ModKey) -> Self {
+    pub fn new(
+        config: Rc<RefCell<Config>>,
+        mod_key: ModKey,
+        text_renderer: *mut TextRenderer,
+    ) -> Self {
         Self {
             is_open: false,
             config,
             mod_key,
             buffers: RefCell::new(HashMap::new()),
+            text_renderer,
         }
     }
 
@@ -102,8 +103,14 @@ impl HotkeyOverlay {
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
             let renderer = renderer.as_gles_renderer();
-            render(renderer, &self.config.borrow(), self.mod_key, scale)
-                .unwrap_or_else(|_| RenderedOverlay { buffer: None })
+            render(
+                renderer,
+                &self.config.borrow(),
+                self.mod_key,
+                scale,
+                self.text_renderer,
+            )
+            .unwrap_or_else(|_| RenderedOverlay { buffer: None })
         });
         let buffer = rendered.buffer.as_ref()?;
 
@@ -139,11 +146,6 @@ impl HotkeyOverlay {
 
             let key = key.map(|key| key_name(true, self.mod_key, &key));
             let key = key.as_deref().unwrap_or("not bound");
-
-            let action = match pango::parse_markup(&action, '\0') {
-                Ok((_attrs, text, _accel)) => text,
-                Err(_) => action.into(),
-            };
 
             writeln!(&mut buf, "{key} {action}").unwrap();
         }
@@ -308,12 +310,12 @@ fn render(
     config: &Config,
     mod_key: ModKey,
     scale: f64,
+    text_renderer: *mut TextRenderer,
 ) -> anyhow::Result<RenderedOverlay> {
     let _span = tracy_client::span!("hotkey_overlay::render");
 
-    // let margin = MARGIN * scale;
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
+    let padding: f32 = to_physical_precise_round(scale, PADDING);
+    let border: f32 = to_physical_precise_round(scale, BORDER);
 
     // FIXME: if it doesn't fit, try splitting in two columns or something.
     // let mut target_size = output_size;
@@ -326,119 +328,86 @@ fn render(
         .filter_map(|action| format_bind(&config.binds.0, action))
         .map(|(key, action)| {
             let key = key.map(|key| key_name(false, mod_key, &key));
-            let key = key.as_deref().unwrap_or("(not bound)");
+            let key = key.as_deref().unwrap_or("(not found)");
             let key = format!(" {key} ");
             (key, action)
         })
         .collect::<Vec<_>>();
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let text_renderer = unsafe { &mut *text_renderer };
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
+    let title_attrs = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::SansSerif)
+        .weight(cosmic_text::Weight::BOLD);
 
-    let bold = AttrList::new();
-    bold.insert(AttrInt::new_weight(Weight::Bold));
-    layout.set_attributes(Some(&bold));
-    layout.set_text(TITLE);
-    let title_size = layout.pixel_size();
+    let normal_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif);
 
-    let attrs = AttrList::new();
-    attrs.insert(AttrString::new_family("Monospace"));
-    attrs.insert(AttrColor::new_background(12000, 12000, 12000));
+    let key_attrs = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(cosmic_text::Weight::BOLD)
+        .metadata(1);
 
-    layout.set_attributes(Some(&attrs));
-    let key_sizes = strings
+    let space_attrs = cosmic_text::Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(cosmic_text::Weight::BOLD);
+
+    let title = format!(" \t     {TITLE} ");
+
+    let mut spans: Vec<(&str, &cosmic_text::Attrs)> =
+        vec![(&title, &title_attrs), ("\n\n", &normal_attrs)];
+
+    let mut spacers = Vec::with_capacity(strings.len());
+
+    let max_len = strings
         .iter()
-        .map(|(key, _)| {
-            layout.set_text(key);
-            layout.pixel_size()
-        })
-        .collect::<Vec<_>>();
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap();
 
-    layout.set_attributes(None);
-    let action_sizes = strings
-        .iter()
-        .map(|(_, action)| {
-            layout.set_markup(action);
-            layout.pixel_size()
-        })
-        .collect::<Vec<_>>();
-
-    let key_width = key_sizes.iter().map(|(w, _)| w).max().unwrap();
-    let action_width = action_sizes.iter().map(|(w, _)| w).max().unwrap();
-    let mut width = key_width + padding + action_width;
-
-    let mut height = zip(&key_sizes, &action_sizes)
-        .map(|((_, key_h), (_, act_h))| max(key_h, act_h))
-        .sum::<i32>()
-        + (key_sizes.len() - 1) as i32 * line_interval
-        + title_size.1
-        + padding;
-
-    width += padding * 2;
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-
-    cr.set_source_rgb(1., 1., 1.);
-
-    cr.move_to(((width - title_size.0) / 2).into(), padding.into());
-    layout.set_attributes(Some(&bold));
-    layout.set_text(TITLE);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(padding.into(), (padding + title_size.1 + padding).into());
-
-    for ((key, action), ((_, key_h), (_, act_h))) in zip(&strings, zip(&key_sizes, &action_sizes)) {
-        layout.set_attributes(Some(&attrs));
-        layout.set_text(key);
-        pangocairo::functions::show_layout(&cr, &layout);
-
-        cr.rel_move_to((key_width + padding).into(), 0.);
-
-        let (attrs, text) = match pango::parse_markup(action, '\0') {
-            Ok((attrs, text, _accel)) => (Some(attrs), text),
-            Err(err) => {
-                warn!("error parsing markup for key {key}: {err}");
-                (None, action.into())
-            }
-        };
-
-        layout.set_attributes(attrs.as_ref());
-        layout.set_text(&text);
-        pangocairo::functions::show_layout(&cr, &layout);
-
-        cr.rel_move_to(
-            (-(key_width + padding)).into(),
-            (max(key_h, act_h) + line_interval).into(),
-        );
+    for (key, _) in &strings {
+        let count = key.chars().count();
+        let needed = max_len - count;
+        let spacer = format!(" {}", " ".repeat(needed));
+        spacers.push(spacer);
     }
 
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.5, 0.8, 1.0);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
+    for (i, (key, action)) in strings.iter().enumerate() {
+        spans.push((key, &key_attrs));
+        spans.push((spacers[i].as_str(), &space_attrs));
+        spans.push((action, &normal_attrs));
+        spans.push(("\n\n", &normal_attrs));
+    }
 
-    let data = surface.take_data().unwrap();
+    text_renderer.buffer(14.0, scale as f32);
+    text_renderer.set_span(
+        &spans,
+        cosmic_text::Shaping::Advanced,
+        cosmic_text::Align::Left,
+        (Some(800.0 * scale as f32), None),
+        false,
+    );
+
+    let mut pixmap = text_renderer
+        .draw_rect(
+            border,
+            padding,
+            tiny_skia::Color::from_rgba(0.102, 0.102, 0.102, 0.933).unwrap(), // Matte glass panel
+            tiny_skia::Color::from_rgba(1.0, 0.330, 0.330, 0.500).unwrap(), // Soft Blue highlight border
+        )
+        .unwrap();
+
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+
+    text_renderer.draw_text_with_highlight(
+        &mut pixmap,
+        border,
+        padding,
+        tiny_skia::Color::from_rgba(0.233, 0.233, 0.211, 0.933).unwrap(),
+    );
+
+    let data = pixmap.take();
+
     let buffer = TextureBuffer::from_memory(
         renderer,
         &data,

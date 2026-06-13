@@ -3,10 +3,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
 
+use cosmic_text::{Attrs, Weight};
 use niri_config::Config;
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{Alignment, FontDescription};
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
@@ -20,11 +19,10 @@ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::ui::text_renderer::TextRenderer;
 use crate::utils::{output_size, to_physical_precise_round};
 
-const KEY_NAME: &str = "Enter";
 const PADDING: i32 = 16;
-const FONT: &str = "sans 14px";
 const BORDER: i32 = 8;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
 
@@ -34,6 +32,7 @@ pub struct ExitConfirmDialog {
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
+    text_renderer: *mut TextRenderer,
 }
 
 niri_render_elements! {
@@ -55,8 +54,12 @@ enum State {
 }
 
 impl ExitConfirmDialog {
-    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
-        let buffer = match render(1.) {
+    pub fn new(
+        clock: Clock,
+        config: Rc<RefCell<Config>>,
+        text_renderer: *mut TextRenderer,
+    ) -> Self {
+        let buffer = match render(1., text_renderer) {
             Ok(x) => Some(x),
             Err(err) => {
                 warn!("error creating the exit confirm dialog: {err:?}");
@@ -69,6 +72,7 @@ impl ExitConfirmDialog {
             buffers: RefCell::new(HashMap::from([(NotNan::new(1.).unwrap(), buffer)])),
             clock,
             config,
+            text_renderer,
         }
     }
 
@@ -173,7 +177,7 @@ impl ExitConfirmDialog {
 
         let buffer = buffers
             .entry(NotNan::new(scale).unwrap())
-            .or_insert_with(|| render(scale).ok());
+            .or_insert_with(|| render(scale, self.text_renderer).ok());
         let buffer = buffer.as_ref().unwrap_or(&fallback);
 
         let size = buffer.logical_size();
@@ -222,57 +226,63 @@ impl ExitConfirmDialog {
     }
 }
 
-fn render(scale: f64) -> anyhow::Result<MemoryBuffer> {
+fn render(scale: f64, text_renderer: *mut TextRenderer) -> anyhow::Result<MemoryBuffer> {
     let _span = tracy_client::span!("exit_confirm_dialog::render");
 
-    let markup = text(true);
+    let border: f32 = to_physical_precise_round(scale, BORDER);
+    let padding: f32 = to_physical_precise_round(scale, PADDING);
 
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
+    let normal_attrs = Attrs::new().family(cosmic_text::Family::SansSerif);
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let key_attrs = Attrs::new()
+        .family(cosmic_text::Family::Monospace)
+        .weight(Weight::BOLD)
+        .metadata(1);
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_markup(&markup);
+    let spans = [
+        (
+            "Are you sure you want to exit niri?\n\n    Press ",
+            &normal_attrs,
+        ),
+        (" Enter ", &key_attrs),
+        (" to confirm.", &normal_attrs),
+    ];
 
-    let (mut width, mut height) = layout.pixel_size();
-    width += padding * 2;
-    height += padding * 2;
+    let tr = unsafe { &mut *text_renderer };
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    tr.buffer(14.0, scale as f32);
 
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_markup(&markup);
+    tr.set_span(
+        &spans,
+        cosmic_text::Shaping::Advanced,
+        cosmic_text::Align::Left,
+        (Some(500.0 * scale as f32), None),
+        false,
+    );
 
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
+    let mut pixmap = tr
+        .draw_rect(
+            border,
+            padding,
+            tiny_skia::Color::from_rgba(0.102, 0.102, 0.102, 0.933).unwrap(),
+            tiny_skia::Color::from_rgba(0.330, 0.330, 1.0, 0.500).unwrap(),
+        )
+        .unwrap();
 
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(1., 0.3, 0.3);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
+    let width: i32 = pixmap.width() as i32;
+    let height: i32 = pixmap.height() as i32;
 
-    let data = surface.take_data().unwrap();
+    tr.draw_text_with_highlight(
+        &mut pixmap,
+        border,
+        padding,
+        tiny_skia::Color::from_rgba(0.233, 0.233, 0.211, 0.933).unwrap(),
+    );
+
+    let data = pixmap.take();
+
     let buffer = MemoryBuffer::new(
-        data.to_vec(),
+        data,
         Fourcc::Argb8888,
         (width, height),
         scale,
@@ -280,19 +290,6 @@ fn render(scale: f64) -> anyhow::Result<MemoryBuffer> {
     );
 
     Ok(buffer)
-}
-
-fn text(markup: bool) -> String {
-    let key = if markup {
-        format!("<span face='mono' bgcolor='#2C2C2C'> {KEY_NAME} </span>")
-    } else {
-        String::from(KEY_NAME)
-    };
-
-    format!(
-        "Are you sure you want to exit niri?\n\n\
-         Press {key} to confirm."
-    )
 }
 
 #[cfg(feature = "dbus")]
