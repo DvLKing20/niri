@@ -21,12 +21,11 @@ impl Default for TextRenderer {
 
 impl TextRenderer {
     pub fn buffer(&mut self, font_size: f32, scale: f32) {
-        let metrics = Metrics::new(font_size * scale, font_size * scale);
-
         if self.scale.is_none() {
             self.scale = Some(scale);
 
             if self.buffer.is_none() {
+                let metrics = Metrics::new(font_size * scale, font_size * scale);
                 let buffer = Buffer::new(&mut self.font_system, metrics);
                 self.buffer = Some(buffer);
                 self.buffer.as_mut().unwrap().set_metrics(metrics);
@@ -34,10 +33,11 @@ impl TextRenderer {
         }
 
         if self.scale.is_some() && self.scale.unwrap() != scale {
-            self.buffer.as_mut().unwrap().set_metrics(metrics);
-            self.scale = Some(scale);
             self.swash_cache.image_cache.clear();
             self.swash_cache.outline_command_cache.clear();
+            let metrics = Metrics::new(font_size * scale, font_size * scale);
+            self.buffer.as_mut().unwrap().set_metrics(metrics);
+            self.scale = Some(scale);
         }
     }
 
