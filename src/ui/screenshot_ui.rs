@@ -1152,6 +1152,8 @@ fn render_panel(
     // let border_width = (f64::from(BORDER) / 2. * scale).round() * 2.;
     // let half_border_width = (border_width / 2.) as i32;
     let border: f32 = to_physical_precise_round(scale, BORDER);
+    let radius: f32 = to_physical_precise_round(scale, 25);
+    let stroke: f32 = to_physical_precise_round(scale, 2.);
 
     let font_size = 14.0;
 
@@ -1160,11 +1162,9 @@ fn render_panel(
     tr.buffer(font_size, scale as f32);
 
     let default_attrs = Attrs::new()
-        .family(cosmic_text::Family::SansSerif)
         .color(cosmic_text::Color::rgb(255, 255, 255));
 
     let attrs_key = Attrs::new()
-        .family(cosmic_text::Family::Monospace)
         .weight(cosmic_text::Weight::BOLD)
         .metadata(1);
 
@@ -1185,23 +1185,74 @@ fn render_panel(
     );
 
     let mut pixmap = tr
-        .draw_rect(
+        .draw_rect_extra(
             border,
             padding,
-            tiny_skia::Color::from_rgba(0.102, 0.102, 0.102, 0.933).unwrap(),
-            tiny_skia::Color::from_rgba(0.2666, 0.2666, 0.2666, 1.0).unwrap(),
+            radius,
+            tiny_skia::Color::from_rgba(0.1, 0.1, 0.1, 1.).unwrap(),
+            tiny_skia::Color::from_rgba(0.3, 0.3, 0.3, 1.).unwrap(),
         )
         .unwrap();
 
-    let width: i32 = pixmap.width() as i32;
-    let height: i32 = pixmap.height() as i32;
+    let highlight = tiny_skia::Color::from_rgba(0.233, 0.233, 0.211, 0.833).unwrap();
+    tr.draw_text_with_highlight_extra(&mut pixmap, border, padding, radius, highlight);
 
-    tr.draw_text_with_highlight(
-        &mut pixmap,
-        border,
-        padding,
-        Color::from_rgba(0.244, 0.233, 0.211, 0.500).unwrap(),
+    let path = tiny_skia::PathBuilder::from_circle(
+        pixmap.width() as f32 * 0.08,
+        pixmap.height() as f32 / 2.,
+        radius,
+    )
+    .unwrap();
+
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color(tiny_skia::Color::from_rgba(1., 1., 1., 1.).unwrap());
+    paint.anti_alias = true;
+
+    pixmap.fill_path(
+        &path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
     );
+
+    let path = tiny_skia::PathBuilder::from_circle(
+        pixmap.width() as f32 * 0.08,
+        pixmap.height() as f32 / 2.,
+        radius - stroke
+    )
+    .unwrap();
+
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color(tiny_skia::Color::from_rgba(0.1, 0.1, 0.1, 1.).unwrap());
+
+    pixmap.fill_path(
+        &path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+     let path = tiny_skia::PathBuilder::from_circle(
+        pixmap.width() as f32 * 0.08,
+        pixmap.height() as f32 / 2.,
+    
+        radius - (stroke * 2.)
+    )
+    .unwrap();
+
+    paint.set_color(tiny_skia::Color::from_rgba(1., 1., 1., 1.).unwrap());
+
+    pixmap.fill_path(
+        &path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
 
     let data = pixmap.take();
 

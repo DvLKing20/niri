@@ -94,6 +94,64 @@ impl TextRenderer {
         Pixmap::new(box_w as u32, box_h as u32)
     }
 
+    pub fn draw_rect_extra(
+        &self,
+        border: f32,
+        padding: f32,
+        space: f32,
+        bg_color: Color,
+        bd_color: Color,
+    ) -> Option<Pixmap> {
+        let Some(buffer) = &self.buffer else {
+            return None;
+        };
+
+        let mut text_w = 0.0f32;
+        let mut text_h = 0.0f32;
+
+        for run in buffer.layout_runs() {
+            text_w = text_w.max(run.line_w);
+            text_h = text_h.max(run.line_height + run.line_top);
+        }
+
+        let box_w = text_w + (padding * 2.0) + (border * 2.0) + (space * 2.);
+        let box_h = text_h + (padding * 2.0) + (border * 2.0);
+
+        let mut pixmap = Pixmap::new(box_w as u32, box_h as u32).unwrap();
+
+        let mut paint_bg = Paint::default();
+        paint_bg.set_color(bg_color);
+        paint_bg.anti_alias = false;
+
+        let bg_rect = Rect::from_xywh(0.0, 0.0, box_w, box_h).unwrap();
+
+        pixmap.fill_rect(bg_rect, &paint_bg, Transform::identity(), None);
+
+        let stroke = Stroke {
+            width: border,
+            ..Default::default()
+        };
+
+        let border_rect =
+            Rect::from_xywh(border / 2.0, border / 2.0, box_w - border, box_h - border).unwrap();
+
+        let mut paint_border = Paint::default();
+        paint_border.set_color(bd_color);
+        paint_border.anti_alias = false;
+
+        let border_path = PathBuilder::from_rect(border_rect);
+
+        pixmap.stroke_path(
+            &border_path,
+            &paint_border,
+            &stroke,
+            Transform::identity(),
+            None,
+        );
+
+        Some(pixmap)
+    }
+
     pub fn draw_rect(
         &self,
         border: f32,
@@ -221,6 +279,75 @@ impl TextRenderer {
             cosmic_text::Color::rgb(255, 255, 255),
             |x, y, w, h, color| {
                 let x = x as f32 + border + padding;
+                let y = y as f32 + border + padding;
+
+                paint.set_color_rgba8(color.r(), color.g(), color.b(), color.a());
+
+                pixmap.fill_rect(
+                    Rect::from_xywh(x, y, w as f32, h as f32).unwrap(),
+                    &paint,
+                    Transform::identity(),
+                    None,
+                );
+            },
+        );
+    }
+
+    pub fn draw_text_with_highlight_extra(
+        &mut self,
+        pixmap: &mut Pixmap,
+        border: f32,
+        padding: f32,
+        radius: f32,
+        color: Color,
+    ) {
+        let Some(buffer) = &mut self.buffer else {
+            return;
+        };
+
+        let mut paint = Paint {
+            anti_alias: false,
+            ..Default::default()
+        };
+
+        let offset = (pixmap.width() as f32 * 0.07) + radius;
+
+        paint.set_color(color);
+
+        for run in buffer.layout_runs() {
+            let mut bg_start: Option<f32> = None;
+            let mut bg_end = 0.0f32;
+
+            for glyph in run.glyphs.iter() {
+                if glyph.metadata == 1 {
+                    if bg_start.is_none() {
+                        bg_start = Some(glyph.x);
+                    }
+                    bg_end = glyph.x + glyph.w;
+                }
+            }
+
+            if let Some(raw_x) = bg_start {
+                let x = raw_x + border + padding + offset;
+                let y = run.line_top + border + padding - 3.;
+                let w = bg_end - raw_x; // both raw, offset only affects position not size
+                let h = run.line_height;
+
+                pixmap.fill_rect(
+                    Rect::from_xywh(x, y, w, h + 6.).unwrap(),
+                    &paint,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+
+        buffer.draw(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            cosmic_text::Color::rgb(255, 255, 255),
+            |x, y, w, h, color| {
+                let x = x as f32 + border + padding + offset;
                 let y = y as f32 + border + padding;
 
                 paint.set_color_rgba8(color.r(), color.g(), color.b(), color.a());
